@@ -1,0 +1,247 @@
+{
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "actions": {
+      "Get_Access_Token": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "https://login.microsoftonline.com/@{parameters('tenantId')}/oauth2/v2.0/token",
+          "headers": {
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+          "body": "grant_type=client_credentials&client_id=@{encodeURIComponent(parameters('clientId'))}&client_secret=@{encodeURIComponent(parameters('clientSecret'))}&scope=https://management.azure.com/.default"
+        },
+        "runAfter": {}
+      },
+      "Parse_Access_Token": {
+        "type": "ParseJson",
+        "inputs": {
+          "content": "@{body('Get_Access_Token')}",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "access_token": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "runAfter": {
+          "Get_Access_Token": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Get_Cost_Data": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "https://management.azure.com/subscriptions/@{encodeURIComponent(parameters('subscriptionId'))}/providers/Microsoft.CostManagement/query?api-version=2021-10-01",
+          "headers": {
+            "Authorization": "Bearer @{body('Parse_Access_Token')?['access_token']}",
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "type": "ActualCost",
+            "dataSet": {
+              "granularity": "Daily",
+              "aggregation": {
+                "totalCost": {
+                  "name": "PreTaxCost",
+                  "function": "Sum"
+                }
+              }
+            },
+            "timeframe": "Custom",
+            "timePeriod": {
+              "from": "@{addDays(utcNow(), -1, 'yyyy-MM-dd')}T00:00:00Z",
+              "to": "@{addDays(utcNow(), -1, 'yyyy-MM-dd')}T23:59:59Z"
+            }
+          }
+        },
+        "runAfter": {
+          "Parse_Access_Token": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Parse_Cost_Response": {
+        "type": "ParseJson",
+        "inputs": {
+          "content": "@{body('Get_Cost_Data')}",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "properties": {
+                "type": "object",
+                "properties": {
+                  "rows": {
+                    "type": "array",
+                    "items": {
+                      "type": "array"
+                    }
+                  },
+                  "columns": {
+                    "type": "array"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "runAfter": {
+          "Get_Cost_Data": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Extract_Total_Cost": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "totalCost",
+              "type": "float",
+              "value": "@{if(empty(body('Parse_Cost_Response')?['properties']?['rows']), 0, float(body('Parse_Cost_Response')?['properties']?['rows'][0][0]))}"
+            }
+          ]
+        },
+        "runAfter": {
+          "Parse_Cost_Response": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Check_Cost_Threshold": {
+        "type": "If",
+        "expression": {
+          "and": [
+            {
+              "greater": [
+                "@{variables('totalCost')}",
+                300
+              ]
+            }
+          ]
+        },
+        "actions": {
+          "Send_Email_Alert": {
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['office365']['connectionId']"
+                }
+              },
+              "method": "post",
+              "path": "/v2/Mail",
+              "body": {
+                "To": "@{parameters('emailRecipient')}",
+                "Subject": "Cost Alert: Previous Day Cost Exceeded Threshold",
+                "Body": "<p>Hello,</p><p>The previous day's Azure cost is <strong>$@{variables('totalCost')}</strong>, which has exceeded the threshold of <strong>$300</strong>.</p><p>Please review and optimize resource usage promptly.</p><p>Date: @{addDays(utcNow(), -1, 'yyyy-MM-dd')}</p>",
+                "Importance": "High"
+              }
+            },
+            "runAfter": {}
+          }
+        },
+        "else": {
+          "actions": {
+            "Log_No_Alert": {
+              "type": "Compose",
+                "inputs": "Cost did not exceed threshold, no alert needed. Previous day cost: $@{variables('totalCost')}"
+            }
+          }
+        },
+        "runAfter": {
+          "Extract_Total_Cost": [
+            "Succeeded"
+          ]
+        }
+      }
+    },
+    "contentVersion": "1.0.0.0",
+    "outputs": {},
+    "parameters": {
+      "$connections": {
+        "defaultValue": {},
+        "type": "Object"
+      },
+      "subscriptionId": {
+        "defaultValue": "",
+        "type": "String",
+        "metadata": {
+          "description": "Azure Subscription ID"
+        }
+      },
+      "emailRecipient": {
+        "defaultValue": "",
+        "type": "String",
+        "metadata": {
+          "description": "Email address to receive cost alerts"
+        }
+      },
+      "tenantId": {
+        "defaultValue": "",
+        "type": "String",
+        "metadata": {
+          "description": "Azure AD Tenant ID"
+        }
+      },
+      "clientId": {
+        "defaultValue": "",
+        "type": "String",
+        "metadata": {
+          "description": "Azure AD Application (Service Principal) Client ID"
+        }
+      },
+      "clientSecret": {
+        "defaultValue": "",
+        "type": "String",
+        "metadata": {
+          "description": "Azure AD Application (Service Principal) Client Secret"
+        }
+      }
+    },
+    "triggers": {
+      "Recurrence": {
+        "recurrence": {
+          "frequency": "Day",
+          "interval": 1,
+          "schedule": {
+            "hours": [
+              9
+            ],
+            "minutes": [
+              0
+            ]
+          },
+          "timeZone": "China Standard Time"
+        },
+        "type": "Recurrence"
+      }
+    }
+  },
+  "parameters": {
+    "$connections": {
+      "value": {}
+    },
+    "subscriptionId": {
+      "value": ""
+    },
+    "emailRecipient": {
+      "value": ""
+    },
+    "tenantId": {
+      "value": ""
+    },
+    "clientId": {
+      "value": ""
+    },
+    "clientSecret": {
+      "value": ""
+    }
+  }
+}
+
